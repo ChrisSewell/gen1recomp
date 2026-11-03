@@ -15,6 +15,7 @@ if os.getenv("POKEPORT_JIT") == "0" and jit and jit.off then
   print("[info] jit off")
 end
 
+local DuoPosture = require("src.core.DuoPosture")
 local SwitchDiagnostics = require("src.debug.SwitchDiagnostics")
 
 -- Global emergency quit: holding Start + Select for 5 seconds forcefully terminates LOVE.
@@ -1059,6 +1060,9 @@ function love.update(dt)
   -- checkEmergencyQuit runs from love.run each frame; calling it here too
   -- would double-count dt and fire the 5s hold after 2.5s.
   HostDisplay.update(dt)
+  -- foldables: keep the hinge reading fresh (and logged) in the launcher
+  -- too, not only once a game's touch pad asks for it.  Cached, ~10 Hz.
+  DuoPosture.current()
   SwitchDiagnostics.maybeFlush(false)
   -- NX only (no-op elsewhere): follow dock/undock without waiting for SDL.
   NxDisplay.sync()

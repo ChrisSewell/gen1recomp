@@ -36,6 +36,7 @@
 local Input = require("src.core.Input")
 local SafeArea = require("src.core.SafeArea")
 local TouchSkin = require("src.core.TouchSkin")
+local DuoPosture = require("src.core.DuoPosture")
 
 local TouchControls = {}
 
@@ -210,6 +211,17 @@ function TouchControls.normalizeConfig(tc)
       scale = clampScale(b.scale),
     }
   end
+  -- foldable postures (src/core/DuoPosture.lua) own their own buckets; they
+  -- start from the Duo defaults, never from a phone layout
+  for _, o in ipairs(DuoPosture.IDS) do
+    local b = saved and saved[o]
+    if type(b) == "table" then
+      out.layouts[o] = {
+        positions = normalizePositions(b.positions),
+        scale = clampScale(b.scale),
+      }
+    end
+  end
   return out
 end
 
@@ -304,6 +316,11 @@ function TouchControls:init()
   self.hotbarEnabled = true
   self.hotbarOpen = false
   self.hotbarControls = nil
+  -- a light tick when the Duo changes posture and the pad re-lays itself out
+  DuoPosture.onChange = function()
+    self.layoutW, self.layoutH = nil, nil
+    TouchControls.buzz(self.haptics)
+  end
   TouchSkin.setActive(nil)
   self.img = nil
   -- Images load whenever the platform wants the overlay OR the launcher
@@ -363,6 +380,12 @@ function TouchControls:config()
       positions = b and b.positions or nil,
       scale = clampScale(b and b.scale),
     }
+  end
+  for _, o in ipairs(DuoPosture.IDS) do
+    local b = self.layouts and self.layouts[o] or nil
+    if b and (b.positions or (b.scale and b.scale ~= 1)) then
+      out.layouts[o] = { positions = b.positions, scale = clampScale(b.scale) }
+    end
   end
   return out
 end
@@ -446,14 +469,21 @@ end
 function TouchControls:currentBucket()
   local _, _, sw, sh = SafeArea.windowRect()
   local o = orientationFor(sw, sh)
+  -- on a foldable the posture owns the bucket, so a clamshell layout never
+  -- moves the flat one; self.orientation stays portrait/landscape for the
+  -- editor chrome
+  local duo = DuoPosture.current()
+  local key = (duo and duo.controls) and duo.id or o
   self.layouts = self.layouts or { portrait = {}, landscape = {} }
-  local b = self.layouts[o]
+  local b = self.layouts[key]
   if type(b) ~= "table" then
     b = {}
-    self.layouts[o] = b
+    self.layouts[key] = b
   end
   b.scale = clampScale(b.scale)
   self.orientation = o
+  self.bucketKey = key
+  self.duo = (duo and duo.controls) and duo or nil
   self.positions = b.positions
   self.scale = b.scale
   return b
@@ -469,16 +499,21 @@ end
 -- size setting (#633).
 function TouchControls:layout()
   local ox, oy, sw, sh = SafeArea.windowRect()
+  local duo = DuoPosture.current()
+  local duoKey = (duo and duo.controls) and (duo.id .. ":" .. tostring(duo.game and duo.game.w)) or nil
   if self.layoutW == sw and self.layoutH == sh
-     and self.layoutOx == ox and self.layoutOy == oy and self.L then
+     and self.layoutOx == ox and self.layoutOy == oy
+     and self.layoutDuo == duoKey and self.L then
     return self.L
   end
   self.layoutW, self.layoutH = sw, sh
   self.layoutOx, self.layoutOy = ox, oy
+  self.layoutDuo = duoKey
   -- orientation picks which saved layout applies; rotating swaps buckets
   -- because sw/sh swapped, which is already the cache key above (#633)
   local bucket = self:currentBucket()
-  self.L = TouchControls.defaultLayout(sw, sh, ox, oy, bucket.scale, self.shoulders)
+  self.L = (self.duo and DuoPosture.controlLayout(self.duo, bucket.scale, self.shoulders))
+    or TouchControls.defaultLayout(sw, sh, ox, oy, bucket.scale, self.shoulders)
   if bucket.positions then
     for _, name in ipairs(self:controls()) do
       local p = bucket.positions[name]
@@ -595,6 +630,21 @@ function TouchControls:hotbarStrip()
   local x0 = math.max(ox + pad,
                       math.min(zone.cx - total, ox + sw - pad - total))
   local y0 = math.min(zone.cy + zone.w * 0.80, oy + sh - h)
+  if self.duo then
+    -- Duo deck: a row along the bottom edge of the game picture, centred
+    -- on it, so it covers nothing under the thumbs (it used to hang off the
+    -- menu button over the d-pad).  Falls back under the button.
+    local g = self.duo.game
+    if g then
+      total = math.min(g.w - pad * 2, cw * #items)
+      cw = total / #items
+      x0 = g.x + (g.w - total) / 2
+      y0 = g.y + g.h - h - pad * 2
+    else
+      x0 = math.max(ox + pad, math.min(zone.cx - total / 2, ox + sw - pad - total))
+      y0 = math.min(zone.cy + zone.w * 0.5 + pad * 3, oy + sh - h - pad)
+    end
+  end
   local cells = {}
   for i, ctl in ipairs(items) do
     cells[i] = { ctl = ctl, label = ctl.label, h = h,
@@ -967,6 +1017,111 @@ function TouchControls:drawSkin(alphaMul)
   return true
 end
 
+-- Foldable control deck (src/core/DuoPosture.lua): a quiet panel behind
+-- each control area so the pad reads as hardware, not as buttons floating
+-- on black, plus a hairline where the hinge is.  Drawn only when a Duo
+-- posture gives the pad its own half; the stock overlay is unchanged.
+function TouchControls:drawDeck(alphaMul)
+  local duo = self.duo
+  if not duo then return end
+  local G = love.graphics
+  for _, c in ipairs(duo.controls) do
+    local r = math.min(22, math.min(c.w, c.h) * 0.06)
+    local inset = 6
+    G.setColor(0.105, 0.11, 0.125, 0.96 * alphaMul)
+    G.rectangle("fill", c.x + inset, c.y + inset, c.w - inset * 2, c.h - inset * 2, r, r)
+    -- top-edge highlight, like light catching a bevel
+    G.setColor(1, 1, 1, 0.06 * alphaMul)
+    G.setLineWidth(1)
+    G.rectangle("line", c.x + inset + 0.5, c.y + inset + 0.5,
+                c.w - inset * 2 - 1, c.h - inset * 2 - 1, r, r)
+  end
+  local f = duo.fold
+  if f and duo.status == "partial" then
+    G.setColor(1, 1, 1, 0.05 * alphaMul)
+    if f.w > f.h then
+      G.rectangle("fill", f.x, f.y + f.h / 2 - 0.5, f.w, 1)
+    else
+      G.rectangle("fill", f.x + f.w / 2 - 0.5, f.y, 1, f.h)
+    end
+  end
+end
+
+function TouchControls:drawHotbarStrip(alphaMul)
+  love.graphics.setFont(self.labelFont)
+  local pressed = {}
+  for _, touch in pairs(self.touches or {}) do
+    if touch.control == "hotkey" and touch.ctl then pressed[touch.ctl] = true end
+  end
+  local cells = self:hotbarStrip() or {}
+  local first, last = cells[1], cells[#cells]
+  if first and last and self.duo then
+    -- solid panel in the deck's palette with a soft shadow, so the row
+    -- reads as a menu over the d-pad instead of blending into it
+    local pad = first.h * 0.18
+    local x, y = first.x - pad, first.y - pad
+    local w, h = last.x + last.w - first.x + pad * 2, first.h + pad * 2
+    love.graphics.setColor(0, 0, 0, 0.35 * alphaMul)
+    love.graphics.rectangle("fill", x, y + pad * 0.6, w, h, h * 0.32)
+    love.graphics.setColor(0.11, 0.115, 0.13, 0.97 * alphaMul)
+    love.graphics.rectangle("fill", x, y, w, h, h * 0.32)
+    love.graphics.setColor(1, 1, 1, 0.08 * alphaMul)
+    love.graphics.rectangle("line", x + 0.5, y + 0.5, w - 1, h - 1, h * 0.32)
+  elseif first and last then
+    local pad = first.h * 0.14
+    love.graphics.setColor(0.15, 0.15, 0.15, 0.55 * alphaMul)
+    love.graphics.rectangle("fill", first.x - pad, first.y - pad,
+                            last.x + last.w - first.x + pad * 2,
+                            first.h + pad * 2, first.h * 0.3)
+  end
+  for _, cell in ipairs(cells) do
+    local down = pressed[cell.ctl] == true
+    love.graphics.setColor(0.3, 0.3, 0.3,
+      (down and 0.85 or 0.6) * alphaMul)
+    love.graphics.rectangle("fill", cell.x, cell.y, cell.w, cell.h,
+                            cell.h * 0.25)
+    local tw = self.labelFont:getWidth(cell.label)
+    local ty = cell.y + (cell.h - self.labelFont:getHeight()) * 0.5
+    love.graphics.setColor(0, 0, 0, 0.6 * alphaMul)
+    love.graphics.print(cell.label,
+                        cell.x + (cell.w - tw) * 0.5 + 1, ty + 1)
+    love.graphics.setColor(1, 1, 1,
+      (down and ALPHA_PRESSED or (ALPHA + 0.2)) * alphaMul)
+    love.graphics.print(cell.label, cell.x + (cell.w - tw) * 0.5, ty)
+  end
+end
+
+-- The foldable deck with its drawn hardware art (src/render/DuoDeckArt.lua).
+-- Returns false when shaders are unavailable, so draw() falls back to the
+-- bitmap prompts on the plain panel.
+function TouchControls:drawDuoDeck(L, alphaMul)
+  local ok, Art = pcall(require, "src.render.DuoDeckArt")
+  if not ok then
+    if not self.deckArtWarned then
+      self.deckArtWarned = true
+      print("[warn] DuoDeckArt unavailable: " .. tostring(Art))
+    end
+    return false
+  end
+  if not Art.available() then return false end
+  Art.drawShell(self.duo, alphaMul)
+  local dpadTouch = self.dpadTouch and self.touches[self.dpadTouch]
+  local held = {}
+  for btn in pairs(self.held or {}) do held[btn] = true end
+  Art.drawControls(L, {
+    dir = dpadTouch and dpadTouch.dir or nil,
+    held = held,
+    buttons = self:buttons(),
+    hotbar = self:hotbarShown(),
+    hotbarOpen = self.hotbarOpen,
+    alpha = alphaMul,
+  })
+  if self:hotbarShown() and self.hotbarOpen and not self.preview then
+    self:drawHotbarStrip(alphaMul)
+  end
+  return true
+end
+
 -- OS-window space, called after GameViewport.finish so the overlay rides on
 -- top of the game, companion composition and post-processing without being
 -- captured or scaled with any game viewport. Also used by the launcher layout
@@ -983,6 +1138,11 @@ function TouchControls:draw()
   local alphaMul = (self.preview and self.enabled == false) and 0.45 or 1
   love.graphics.push("all")
   love.graphics.origin()
+  if self.duo and self:drawDuoDeck(L, alphaMul) then
+    love.graphics.pop()
+    return
+  end
+  if self.duo then self:drawDeck(alphaMul) end
 
   local dpadTouch = self.dpadTouch and self.touches[self.dpadTouch]
   local dir = dpadTouch and dpadTouch.dir
@@ -1020,34 +1180,7 @@ function TouchControls:draw()
       love.graphics.circle("fill", z.cx + i * r * 0.5, z.cy, dot)
     end
     if self.hotbarOpen and not self.preview then
-      local pressed = {}
-      for _, touch in pairs(self.touches or {}) do
-        if touch.control == "hotkey" and touch.ctl then pressed[touch.ctl] = true end
-      end
-      local cells = self:hotbarStrip() or {}
-      local first, last = cells[1], cells[#cells]
-      if first and last then
-        local pad = first.h * 0.14
-        love.graphics.setColor(0.15, 0.15, 0.15, 0.55 * alphaMul)
-        love.graphics.rectangle("fill", first.x - pad, first.y - pad,
-                                last.x + last.w - first.x + pad * 2,
-                                first.h + pad * 2, first.h * 0.3)
-      end
-      for _, cell in ipairs(cells) do
-        local down = pressed[cell.ctl] == true
-        love.graphics.setColor(0.3, 0.3, 0.3,
-          (down and 0.85 or 0.6) * alphaMul)
-        love.graphics.rectangle("fill", cell.x, cell.y, cell.w, cell.h,
-                                cell.h * 0.25)
-        local tw = self.labelFont:getWidth(cell.label)
-        local ty = cell.y + (cell.h - self.labelFont:getHeight()) * 0.5
-        love.graphics.setColor(0, 0, 0, 0.6 * alphaMul)
-        love.graphics.print(cell.label,
-                            cell.x + (cell.w - tw) * 0.5 + 1, ty + 1)
-        love.graphics.setColor(1, 1, 1,
-          (down and ALPHA_PRESSED or (ALPHA + 0.2)) * alphaMul)
-        love.graphics.print(cell.label, cell.x + (cell.w - tw) * 0.5, ty)
-      end
+      self:drawHotbarStrip(alphaMul)
     end
   end
 

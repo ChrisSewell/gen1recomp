@@ -54,6 +54,12 @@ function SafeArea.windowRect()
   y = math.max(0, math.min(y, wh))
   w = math.max(1, math.min(w, ww - x))
   h = math.max(1, math.min(h, wh - y))
+  -- iPhone Duo cover display: use the camera column too (src/core/DuoPosture)
+  local okDuo, Duo = pcall(require, "src.core.DuoPosture")
+  if okDuo and Duo and Duo.adjustSafe then
+    local ok2, ax, ay, aw, ah = pcall(Duo.adjustSafe, ww, wh, x, y, w, h)
+    if ok2 and ax then x, y, w, h = ax, ay, aw, ah end
+  end
   return x, y, w, h
 end
 
