@@ -349,9 +349,82 @@ static void GRInstallApplicationURLHooks(void)
 }
 @end
 
+// SDL's Metal view fixes layer.contentsScale to the screen's nativeScale when
+// it is created, but SDL_GetWindowSizeInPixels reads the current nativeScale.
+// The iPhone Duo's inner display changes its point size, and so its
+// nativeScale, between postures (951x669 flat, 890x626 half open). With a
+// stale scale the drawable no longer matches the pixel size LÖVE draws to,
+// and the frame shrinks toward the top-left with black on the right and
+// bottom. Refresh the scale before SDL sizes the drawable.
+static IMP GRMetalUpdateDrawableSizeOriginal;
+
+static void GRMetalUpdateDrawableSize(UIView *self, SEL selector)
+{
+    CALayer *layer = self.layer;
+    UIScreen *screen = self.window.screen;
+    // contentsScale 1 means a low-DPI window; SDL keeps that at 1.
+    if (screen && layer.contentsScale > 1.0) {
+        CGFloat scale = screen.nativeScale;
+        if (scale > 0 && fabs(layer.contentsScale - scale) > 0.001) {
+            layer.contentsScale = scale;
+        }
+    }
+    ((void (*)(id, SEL))GRMetalUpdateDrawableSizeOriginal)(self, selector);
+}
+
+static void GRInstallMetalScaleHook(void)
+{
+    Class metalView = NSClassFromString(@"SDL_uikitmetalview");
+    Method method = metalView
+        ? class_getInstanceMethod(metalView, @selector(updateDrawableSize)) : NULL;
+    if (method && !GRMetalUpdateDrawableSizeOriginal) {
+        GRMetalUpdateDrawableSizeOriginal =
+            method_setImplementation(method, (IMP)GRMetalUpdateDrawableSize);
+    }
+}
+
+// SDL's UIKit_ComputeViewFrame flips the window frame to match the
+// deprecated -[UIApplication statusBarOrientation]. On the iPhone Duo's inner
+// display that keeps answering portrait while the scene is landscape, so SDL
+// turns the 951x669 window back into 669x951 about a second after each
+// rotation and only the top-left of the frame is visible. Answer with the
+// window scene's real interface orientation instead.
+static IMP GRStatusBarOrientationOriginal;
+
+static UIInterfaceOrientation GRStatusBarOrientation(UIApplication *self, SEL selector)
+{
+    UIWindowScene *best = nil;
+    for (UIScene *scene in self.connectedScenes) {
+        if (![scene isKindOfClass:[UIWindowScene class]]) continue;
+        if (!best || scene.activationState == UISceneActivationStateForegroundActive) {
+            best = (UIWindowScene *)scene;
+        }
+    }
+    UIInterfaceOrientation orientation = UIInterfaceOrientationUnknown;
+    if (@available(iOS 16.0, *)) {
+        orientation = best.effectiveGeometry.interfaceOrientation;
+    } else {
+        orientation = best.interfaceOrientation;
+    }
+    if (orientation != UIInterfaceOrientationUnknown) return orientation;
+    return ((UIInterfaceOrientation (*)(id, SEL))GRStatusBarOrientationOriginal)(self, selector);
+}
+
+static void GRInstallOrientationHook(void)
+{
+    Method method = class_getInstanceMethod([UIApplication class],
+                                            @selector(statusBarOrientation));
+    if (method && !GRStatusBarOrientationOriginal) {
+        GRStatusBarOrientationOriginal =
+            method_setImplementation(method, (IMP)GRStatusBarOrientation);
+    }
+}
+
 __attribute__((constructor))
 static void GRBootstrapInstall(void)
 {
+    GRInstallMetalScaleHook();
+    GRInstallOrientationHook();
     GRInstallDelegateURLHooks();
     NSNotificationCenter *center = [NSNotificationCenter defaultCenter];
     [center addObserverForName:UIApplicationDidFinishLaunchingNotification
